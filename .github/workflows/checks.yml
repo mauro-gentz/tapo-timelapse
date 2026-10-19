@@ -1,0 +1,13 @@
+name: Checks
+on:
+  push:
+  pull_request:
+jobs:
+  syntax-and-offline-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: bash -n install.sh tapo-timelapse tapo-weekly-reboot
+      - name: Run offline tests
+        run: python3 -m unittest discover -s tests -v

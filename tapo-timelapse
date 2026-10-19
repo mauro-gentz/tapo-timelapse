@@ -1,0 +1,402 @@
+#!/usr/bin/env bash
+# Tapo -> PNG/JPEG -> OneDrive via rclone | Raspberry Pi OS Lite 32-bit
+set -Eeuo pipefail
+umask 077
+
+CONF="${TAPO_CONFIG:-/etc/tapo-timelapse.conf}"
+if [[ ! -r "$CONF" ]]; then
+  echo "ERROR: Cannot read configuration: $CONF" >&2
+  exit 2
+fi
+# Source only a trusted root-managed configuration file.
+# shellcheck source=/dev/null
+source "$CONF"
+
+: "${CAMERA_HOST:?CAMERA_HOST is missing}"
+: "${CAMERA_USER:?CAMERA_USER is missing}"
+: "${CAMERA_PASSWORD:?CAMERA_PASSWORD is missing}"
+CAMERA_PORT="${CAMERA_PORT:-554}"
+CAMERA_STREAM="${CAMERA_STREAM:-stream1}"
+IMAGE_FORMAT="${IMAGE_FORMAT:-png}"
+DATA_DIR="${DATA_DIR:-/var/lib/tapo-timelapse}"
+RCLONE_REMOTE="${RCLONE_REMOTE:-onedrive}"
+RCLONE_ROOT="${RCLONE_ROOT:-Timelapse/Grundstueck}"
+RCLONE_CONFIG="${RCLONE_CONFIG:-$HOME/.config/rclone/rclone.conf}"
+RCLONE_CHUNK_SIZE="${RCLONE_CHUNK_SIZE:-5Mi}"
+LOCAL_RETENTION_DAYS="${LOCAL_RETENTION_DAYS:-14}"
+MONITOR_EMAIL_ENABLED="${MONITOR_EMAIL_ENABLED:-yes}"
+MONITOR_LOOKBACK_DAYS="${MONITOR_LOOKBACK_DAYS:-7}"
+SMTP_HOST="${SMTP_HOST:-}"
+SMTP_PORT="${SMTP_PORT:-587}"
+SMTP_USER="${SMTP_USER:-}"
+SMTP_PASSWORD="${SMTP_PASSWORD:-}"
+SMTP_FROM="${SMTP_FROM:-}"
+SMTP_TO="${SMTP_TO:-}"
+SMTP_SECURITY="${SMTP_SECURITY:-starttls}"
+EXPECTED_WIDTH="${EXPECTED_WIDTH:-2304}"
+EXPECTED_HEIGHT="${EXPECTED_HEIGHT:-1296}"
+CAPTURE_INTERVAL_MINUTES="${CAPTURE_INTERVAL_MINUTES:-30}"
+UPLOAD_AFTER_CAPTURE="${UPLOAD_AFTER_CAPTURE:-yes}"
+EMAIL_ON_BOOT="${EMAIL_ON_BOOT:-yes}"
+HEALTH_FREE_SPACE_PERCENT="${HEALTH_FREE_SPACE_PERCENT:-20}"
+HEALTH_STALE_MINUTES="${HEALTH_STALE_MINUTES:-90}"
+UPLOAD_FILE_TIMEOUT_SEC="${UPLOAD_FILE_TIMEOUT_SEC:-180}"
+export DATA_DIR CAPTURE_INTERVAL_MINUTES
+
+if [[ "$IMAGE_FORMAT" != png && "$IMAGE_FORMAT" != jpg ]]; then
+  echo "ERROR: IMAGE_FORMAT must be 'png' or 'jpg'." >&2; exit 2
+fi
+if [[ ! "$EXPECTED_WIDTH" =~ ^[0-9]+$ || ! "$EXPECTED_HEIGHT" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: EXPECTED_WIDTH/EXPECTED_HEIGHT must be positive integers." >&2; exit 2
+fi
+if [[ ! "$LOCAL_RETENTION_DAYS" =~ ^[0-9]+$ ]]; then
+  echo "ERROR: LOCAL_RETENTION_DAYS must be an integer." >&2; exit 2
+fi
+if [[ ! "$CAMERA_PORT" =~ ^[0-9]+$ ]] || [[ ! "$CAMERA_STREAM" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+  echo "ERROR: Invalid CAMERA_PORT or CAMERA_STREAM." >&2; exit 2
+fi
+# RCLONE_ROOT contains only folder segments, not a full remote prefix.
+RCLONE_ROOT="${RCLONE_ROOT#/}"
+RCLONE_ROOT="${RCLONE_ROOT%/}"
+
+log() { printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"; }
+
+# A shared file lock prevents simultaneous ffmpeg and rclone execution.
+# Upload releases it after EVERY file; scheduled captures take priority.
+media_lock() {
+  local fd rc=0
+  mkdir -p -- "$DATA_DIR"
+  exec {fd}>"$DATA_DIR/.media.lock"
+  if ! flock -w 480 "$fd"; then
+    log "ERROR: Resource lock unavailable after 480 seconds." >&2
+    exec {fd}>&-
+    return 1
+  fi
+  "$@" || rc=$?
+  flock -u "$fd"
+  exec {fd}>&-
+  return "$rc"
+}
+
+# Pause before long cloud calls near the next capture slot.
+# Per-file timeout and shared lock prevent simultaneous CPU/RAM-heavy
+# operations.
+pause_near_capture() {
+  local next_stamp next_epoch now delta
+  next_stamp="$(/usr/local/bin/tapo-schedule next)" || return 0
+  next_epoch="$(date -u -d "$next_stamp" +%s 2>/dev/null)" || return 0
+  [[ "$next_epoch" =~ ^[0-9]+$ ]] || return 0
+  now="$(date -u +%s)"
+  delta=$((next_epoch - now))
+  if (( delta >= 0 && delta <= 210 )); then
+    log "Upload paused: next capture in ${delta}s; camera has priority."
+    sleep "$((delta + 3))"
+  fi
+}
+
+# Pass SMTP values only to the notification utility.
+mailcmd() {
+  SMTP_HOST="$SMTP_HOST" SMTP_PORT="$SMTP_PORT" SMTP_USER="$SMTP_USER" \
+  SMTP_PASSWORD="$SMTP_PASSWORD" SMTP_FROM="$SMTP_FROM" SMTP_TO="$SMTP_TO" \
+  SMTP_SECURITY="$SMTP_SECURITY" DATA_DIR="$DATA_DIR" \
+  /usr/local/bin/tapo-notify "$@"
+}
+
+notify_issue() {
+  local key="$1" subject="$2" body="$3"
+  if [[ "$MONITOR_EMAIL_ENABLED" != yes ]]; then return 0; fi
+  body="${body//\\n/$'\n'}"
+  if printf '%s\n' "$body" | mailcmd queue "$key" "$subject"; then
+    mailcmd flush || log "WARNING: SMTP unavailable; notification remains queued locally." >&2
+  else
+    log "WARNING: Could not queue alert email." >&2
+  fi
+}
+
+audit() {
+  export DATA_DIR RCLONE_REMOTE RCLONE_ROOT RCLONE_CONFIG LOCAL_RETENTION_DAYS
+  /usr/local/bin/tapo-schedule sync
+  export MONITOR_LOOKBACK_DAYS MONITOR_EMAIL_ENABLED CAPTURE_INTERVAL_MINUTES
+  export SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASSWORD SMTP_FROM SMTP_TO SMTP_SECURITY
+  local result=0
+  /usr/local/bin/tapo-audit || result=$?
+  mailcmd flush || log "WARNING: SMTP unavailable; scheduled retry will follow." >&2
+  return "$result"
+}
+
+
+camera_url() {
+  # Percent-encode credentials according to RFC 3986 (e.g. @, /, #).
+  export CAMERA_HOST CAMERA_USER CAMERA_PASSWORD CAMERA_PORT CAMERA_STREAM
+  python3 - <<'PY'
+import os
+from urllib.parse import quote
+host = os.environ['CAMERA_HOST'].strip()
+user = quote(os.environ['CAMERA_USER'], safe='')
+password = quote(os.environ['CAMERA_PASSWORD'], safe='')
+port = os.environ['CAMERA_PORT']
+stream = os.environ['CAMERA_STREAM']
+print(f'rtsp://{user}:{password}@{host}:{port}/{stream}')
+PY
+}
+
+capture_file() {
+  local file="$1" url="$2" type="$3"
+  local err attempt rc
+  err="$(mktemp /tmp/tapo-ffmpeg-error.XXXXXX)"
+  for attempt in 1 2 3; do
+    rm -f -- "$file"
+    local -a opts=(-hide_banner -nostdin -loglevel error -rtsp_transport tcp -i "$url" -map 0:v:0 -frames:v 1 -an -sn -dn)
+    if [[ "$type" == png ]]; then
+      opts+=(-c:v png -compression_level 3 -pix_fmt rgb24)
+    else
+      opts+=(-c:v mjpeg -q:v 2 -pix_fmt yuvj420p)
+    fi
+    # Bound RTSP connection and image decoding time.
+    if timeout -s TERM -k 5s 120s ffmpeg "${opts[@]}" -f image2 -update 1 -y "$file" 2>"$err" && [[ -s "$file" ]]; then
+      rm -f -- "$err"
+      return 0
+    else
+      rc=$?
+    fi
+    # ffmpeg error logs may contain credentials:
+    # do not print the raw error output.
+    log "Capture attempt ${attempt}/3 failed (exit code ${rc})." >&2
+    if [[ "$attempt" -lt 3 ]]; then sleep 15; fi
+  done
+  rm -f -- "$file" "$err"
+  return 1
+}
+
+capture() {
+  local slot name dest dir tmp url
+  slot="$(/usr/local/bin/tapo-schedule due)" || return 2
+  if [[ -z "$slot" ]]; then
+    log "Outside the configured ${CAPTURE_INTERVAL_MINUTES}-minute schedule; skipping capture."
+    return 0
+  fi
+  dest="$DATA_DIR/${slot}.${IMAGE_FORMAT}"
+  dir="$(dirname "$dest")"
+  name="$(basename "$dest")"
+  mkdir -p -- "$dir"
+  if [[ -s "$dest" ]]; then
+    log "Capture slot already completed: $dest"
+    return 0
+  fi
+  tmp="$dir/.${name}.part"
+  url="$(camera_url)"
+  log "Capturing photo for $slot from $CAMERA_HOST/$CAMERA_STREAM ..."
+  if media_lock capture_file "$tmp" "$url" "$IMAGE_FORMAT"; then
+    mv -f -- "$tmp" "$dest"
+    check_resolution "$dest" capture
+    log "Saved: $dest ($(du -h "$dest" | cut -f1))"
+    if [[ "$UPLOAD_AFTER_CAPTURE" == yes ]]; then
+      # Upload failure must not mark an already successful capture
+      # as failed. The catch-up timer retries later.
+      upload_one "$dest" || log "WARNING: Upload after capture failed; catch-up timer will retry." >&2
+    fi
+  else
+    log "ERROR: Camera unreachable or no valid image." >&2
+    notify_issue "capture-$(date -u +%F)" \
+      "[Tapo C310] Capture failed: $slot" \
+      "The Raspberry Pi could not capture a photo for $slot after three attempts.\nCamera: ${CAMERA_HOST}\nHost: $(hostname)\nCheck: journalctl -u tapo-capture.service -n 50 --no-pager"
+    return 1
+  fi
+}
+
+check_resolution() {
+  local image="$1" mode="${2:-test}" dimensions width height
+  # Probing a SINGLE IMAGE is fast; a probe failure must never
+  # cause a valid timelapse photo to be removed.
+  dimensions="$(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=width,height -of csv=p=0:s=x "$image" 2>/dev/null || true)"
+  if [[ "$dimensions" =~ ^([0-9]+)x([0-9]+)$ ]]; then
+    width="${BASH_REMATCH[1]}"
+    height="${BASH_REMATCH[2]}"
+    if (( width < EXPECTED_WIDTH || height < EXPECTED_HEIGHT )); then
+      log "WARNING: Captured frame is only ${width}x${height} instead of ${EXPECTED_WIDTH}x${EXPECTED_HEIGHT}. Set Tapo C310 video quality to 3 MP/highest quality in the app!" >&2
+      if [[ "$mode" == capture ]]; then
+        notify_issue "resolution-$(date -u +%F)" \
+          "[Tapo C310] WARNING: Resolution only ${width}x${height}" \
+          "The Tapo C310 is providing only ${width}x${height} pixels instead of ${EXPECTED_WIDTH}x${EXPECTED_HEIGHT}. Set video quality to 3 MP / highest quality in the Tapo app.\nHost: $(hostname)"
+      fi
+    fi
+  fi
+}
+
+probe() {
+  local url result width height
+  url="$(camera_url)"
+  log "Checking C310 RTSP main stream against expected ${EXPECTED_WIDTH}x${EXPECTED_HEIGHT} ..."
+  if ! result="$(timeout -s TERM -k 5s 35s ffprobe -hide_banner -v error -rtsp_transport tcp \
+    -select_streams v:0 -show_entries stream=codec_name,width,height,pix_fmt \
+    -of default=noprint_wrappers=1 "$url")"; then
+      log "ERROR: RTSP stream unreachable (check IP, camera account and RTSP support)." >&2
+      return 1
+  fi
+  printf '%s\n' "$result"
+  width="$(sed -n 's/^width=//p' <<< "$result" | head -n 1)"
+  height="$(sed -n 's/^height=//p' <<< "$result" | head -n 1)"
+  if [[ ! "$width" =~ ^[0-9]+$ || ! "$height" =~ ^[0-9]+$ ]]; then
+    log "ERROR: Could not determine video dimensions." >&2
+    return 2
+  fi
+  if (( width < EXPECTED_WIDTH || height < EXPECTED_HEIGHT )); then
+    log "WARNING: C310 provides ${width}x${height}; expected ${EXPECTED_WIDTH}x${EXPECTED_HEIGHT}. Set Tapo app -> Video quality -> 3 MP / Highest quality." >&2
+    return 3
+  fi
+  log "Resolution OK: ${width}x${height}."
+}
+
+test_capture() {
+  local tmp url
+  tmp="$(mktemp "/tmp/tapo-test.XXXXXX.${IMAGE_FORMAT}")"
+  url="$(camera_url)"
+  log "Testing snapshot capture ..."
+  if media_lock capture_file "$tmp" "$url" "$IMAGE_FORMAT"; then
+    check_resolution "$tmp"
+    log "Test image saved: $tmp ($(du -h "$tmp" | cut -f1))"
+    echo "Copy, for example, using: scp $(id -un)@<RPI-IP>:$tmp ."
+  else
+    rm -f -- "$tmp"
+    log "ERROR: Test capture failed." >&2
+    return 1
+  fi
+}
+
+# Keep a small local receipt for each uploaded file. This avoids
+# rechecking every previously uploaded file every hour.
+receipt_for() {
+  local relative="${1#"$DATA_DIR"/}"
+  printf '%s/.uploaded/%s.ok\n' "$DATA_DIR" "$relative"
+}
+
+upload_one() {
+  local file="$1" relative day_rel dest receipt size existing
+  [[ -s "$file" ]] || return 1
+  if [[ ! -f "$RCLONE_CONFIG" ]]; then
+    log "ERROR: Missing rclone configuration: $RCLONE_CONFIG" >&2
+    return 1
+  fi
+  relative="${file#"$DATA_DIR"/}"
+  if [[ "$relative" == "$file" ]] || [[ ! "$relative" =~ ^[0-9]{4}/[0-9]{2}/[0-9]{2}/[^/]+\.(png|jpg)$ ]]; then
+    log "ERROR: Invalid source file path: $file" >&2
+    return 1
+  fi
+  receipt="$(receipt_for "$file")"
+  size="$(stat -c '%s' "$file")"
+  if [[ -f "$receipt" ]]; then
+    read -r existing < "$receipt" || true
+    [[ "$existing" == "$size" ]] && return 0
+  fi
+  day_rel="${relative%/*}"
+  dest="${RCLONE_REMOTE}:${RCLONE_ROOT}/${relative}"
+  pause_near_capture
+  log "Single-file upload: $relative"
+  if media_lock timeout -s TERM -k 5s "$UPLOAD_FILE_TIMEOUT_SEC" \
+    rclone --config "$RCLONE_CONFIG" copyto "$file" "$dest" \
+    --transfers 1 --checkers 1 --multi-thread-streams 0 \
+    --onedrive-chunk-size "$RCLONE_CHUNK_SIZE" --buffer-size 1Mi \
+    --retries 2 --low-level-retries 3 --log-level ERROR; then
+    mkdir -p -- "$(dirname "$receipt")"
+    printf '%s\n' "$size" > "$receipt"
+    log "OneDrive upload successful: $relative"
+    return 0
+  fi
+  log "ERROR: Upload failed: $relative (original retained locally)" >&2
+  notify_issue "upload-fail-$(date -u +%F)" \
+    "[Tapo C310] WARNING: OneDrive upload failed" \
+    "A captured photo could not be uploaded to OneDrive.\nFile: $relative\nAn hourly retry is scheduled."
+  return 1
+}
+
+upload() {
+  local cutoff today day_dir relative day file failed=0 transferred=0
+  today="$(date -u +%F)"
+  cutoff="$(date -u -d "-${LOCAL_RETENTION_DAYS} days" +%F)"
+  [[ -d "$DATA_DIR" ]] || return 0
+  while IFS= read -r -d '' day_dir; do
+    relative="${day_dir#"$DATA_DIR"/}"
+    [[ "$relative" =~ ^[0-9]{4}/[0-9]{2}/[0-9]{2}$ ]] || continue
+    day="${relative//\//-}"
+    [[ "$day" > "$today" ]] && continue
+    while IFS= read -r -d '' file; do
+      if [[ ! -s "$(receipt_for "$file")" ]]; then
+        if upload_one "$file"; then transferred=$((transferred + 1)); else failed=$((failed + 1)); fi
+      else
+        # Reupload when an image was changed after its initial upload.
+        if [[ "$(head -n 1 "$(receipt_for "$file")")" != "$(stat -c '%s' "$file")" ]]; then
+          if upload_one "$file"; then transferred=$((transferred + 1)); else failed=$((failed + 1)); fi
+        fi
+      fi
+    done < <(find "$day_dir" -maxdepth 1 -type f \( -name '*.png' -o -name '*.jpg' \) -print0 | sort -z)
+
+    # Delete old originals ONLY after full remote verification.
+    if [[ "$day" < "$cutoff" ]]; then
+      if media_lock timeout -s TERM -k 5s 240s \
+        rclone --config "$RCLONE_CONFIG" check "$day_dir" \
+        "${RCLONE_REMOTE}:${RCLONE_ROOT}/${relative}" \
+        --include '*.png' --include '*.jpg' --one-way --size-only \
+        --checkers 1 --log-level ERROR; then
+        rm -f -- "$day_dir"/*.png "$day_dir"/*.jpg
+        rmdir -- "$day_dir" 2>/dev/null || true
+        rm -rf -- "$DATA_DIR/.uploaded/$relative"
+        log "Retention: $relative removed locally after verified remote check"
+      else
+        failed=$((failed + 1))
+        log "WARNING: Retention skipped for $relative: remote check failed" >&2
+      fi
+    fi
+  done < <(find "$DATA_DIR" -mindepth 3 -maxdepth 3 -type d       ! -path "$DATA_DIR/.uploaded/*" -print0 | sort -z)
+  log "Catch-up upload: $transferred new image(s), $failed error(s)"
+  (( failed == 0 ))
+}
+
+health() {
+  export DATA_DIR MONITOR_EMAIL_ENABLED SMTP_HOST SMTP_PORT SMTP_USER \
+    SMTP_PASSWORD SMTP_FROM SMTP_TO SMTP_SECURITY HEALTH_FREE_SPACE_PERCENT \
+    HEALTH_STALE_MINUTES
+  /usr/local/bin/tapo-health
+  mailcmd flush || log "WARNING: Emails remain queued for later delivery" >&2
+}
+
+boot_notify() {
+  if [[ "$EMAIL_ON_BOOT" == yes && "$MONITOR_EMAIL_ENABLED" == yes ]]; then
+    notify_issue "boot-$(cat /proc/sys/kernel/random/boot_id)" \
+      "[Tapo C310] Raspberry Pi started: $(hostname)" \
+      "The timelapse system has restarted.\nTime (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')\nHost: $(hostname)\nCapture and upload timers resume automatically."
+  fi
+}
+
+status() {
+  local today todaydir count expected
+  /usr/local/bin/tapo-schedule sync || return 2
+  today="$(date -u +%F)"
+  todaydir="$DATA_DIR/$(date -u +%Y/%m/%d)"
+  if [[ -d "$todaydir" ]]; then
+    count="$(find "$todaydir" -maxdepth 1 -type f \( -name '*.png' -o -name '*.jpg' \) | wc -l)"
+  else
+    count=0
+  fi
+  expected="$(/usr/local/bin/tapo-schedule expected "$today" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+  echo "UTC date: $today | Photos today: $count / $expected scheduled slots | Interval: $CAPTURE_INTERVAL_MINUTES minutes"
+  echo "Local storage: $DATA_DIR"
+  du -sh "$DATA_DIR" 2>/dev/null || true
+  df -h "$DATA_DIR" 2>/dev/null || true
+  echo "Upcoming timers:"
+  systemctl list-timers 'tapo-*.timer' --no-pager 2>/dev/null || true
+}
+
+case "${1:-}" in
+  capture) capture ;;
+  upload) upload ;;
+  health) health ;;
+  boot-notify) boot_notify ;;
+  audit) audit ;;
+  mail-test) mailcmd test ;;
+  mail-flush) mailcmd flush ;;
+  test) test_capture ;;
+  probe) probe ;;
+  status) status ;;
+  *) echo "Usage: $(basename "$0") {probe|test|capture|upload|audit|mail-test|mail-flush|health|boot-notify|status}" >&2; exit 2 ;;
+esac

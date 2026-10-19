@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Audits complete UTC days against historical, configurable capture slots."""
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+DATA = Path(os.environ.get("DATA_DIR", "/var/lib/tapo-timelapse"))
+ROOT = os.environ.get("RCLONE_ROOT", "Timelapse/Grundstueck").strip("/")
+REMOTE = os.environ.get("RCLONE_REMOTE", "onedrive")
+CONFIG = os.environ.get("RCLONE_CONFIG", os.path.expanduser("~/.config/rclone/rclone.conf"))
+NOTIFIER_BIN = os.environ.get("TAPO_NOTIFIER_BIN", "/usr/local/bin/tapo-notify")
+SCHEDULE_BIN = os.environ.get("TAPO_SCHEDULE_BIN", "/usr/local/bin/tapo-schedule")
+LOOKBACK = max(1, min(30, int(os.environ.get("MONITOR_LOOKBACK_DAYS", "7"))))
+TODAY = dt.datetime.now(dt.timezone.utc).date()
+START_FILE = DATA / ".monitor-start"
+
+
+def slots(names, day):
+    pattern = re.compile(r"^" + re.escape(day.isoformat()) + r"_(0\d|1\d|2[0-3])-([0-5]\d)-00Z\.(png|jpg)$")
+    matched = set()
+    for name in names:
+        m = pattern.fullmatch(name)
+        if m:
+            matched.add(f"{m.group(1)}:{m.group(2)}")
+    return matched
+
+
+def expected_slots(day):
+    r = subprocess.run([SCHEDULE_BIN, "expected", day.isoformat()],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode:
+        raise ValueError("Capture schedule unavailable: " + r.stderr.strip())
+    return set(json.loads(r.stdout))
+
+
+def alert(key, subject, message):
+    if os.environ.get("MONITOR_EMAIL_ENABLED", "yes").strip().lower() != "yes":
+        print("Email delivery disabled; ALERT: " + subject, file=sys.stderr)
+        return False
+    p = subprocess.run([NOTIFIER_BIN, "queue", key, subject],
+                       input=message, text=True, capture_output=True, timeout=20)
+    if p.returncode:
+        print("Could not queue email: " + p.stderr.strip(), file=sys.stderr)
+        return False
+    print(p.stdout.strip())
+    return True
+
+
+def check(day):
+    folder = day.strftime("%Y/%m/%d")
+    path = DATA / folder
+    local_names = [f.name for f in path.iterdir() if f.is_file()] if path.is_dir() else []
+    local_slots = slots(local_names, day)
+    dst = f"{REMOTE}:{ROOT}/{folder}"
+    remote_slots = None
+    error = None
+    if not Path(CONFIG).exists():
+        error = "rclone configuration file missing"
+    else:
+        try:
+            cmd = ["rclone", "--config", CONFIG, "lsf", dst, "--files-only", "--format", "p"]
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            if r.returncode:
+                error = "Cannot read OneDrive directory (rclone error; check journalctl)"
+            else:
+                remote_slots = slots(r.stdout.splitlines(), day)
+        except subprocess.TimeoutExpired:
+            error = "OneDrive request timed out after 120 seconds"
+        except OSError as ex:
+            error = f"Unable to launch rclone: {type(ex).__name__}"
+    expected = expected_slots(day)
+    target = len(expected)
+    local_missing = sorted(expected - local_slots)
+    cloud_missing = sorted(expected - remote_slots) if remote_slots is not None else None
+    # If originals have already been removed after retention, a complete
+    # OneDrive day is sufficient; otherwise check both.
+    retention = int(os.environ.get("LOCAL_RETENTION_DAYS", "14"))
+    locally_expected = (TODAY - day).days <= retention or bool(local_slots)
+    ok = cloud_missing == [] and (not locally_expected or not local_missing)
+    print(f"{day}: lokal {len(local_slots)}/{target}; OneDrive " +
+          (f"{len(remote_slots)}/{target}" if remote_slots is not None else "UNAVAILABLE") +
+          ("; OK" if ok else "; ERROR"))
+    state = DATA / ".monitor-state"
+    state.mkdir(parents=True, exist_ok=True, mode=0o700)
+    marker = state / (day.isoformat() + ".alerted")
+    restored = state / (day.isoformat() + ".restored")
+    if not ok:
+        if marker.exists():
+            return False
+        lines = [f"Timelapse alert for UTC day {day.isoformat()}",
+                 f"Local: {len(local_slots)}/{target} scheduled slots.",
+                 f"OneDrive: {len(remote_slots)}/{target} scheduled slots." if remote_slots is not None else "OneDrive: Could not verify."]
+        if locally_expected and local_missing:
+            lines.append("Missing local capture slots (UTC): " + ", ".join(local_missing))
+        if cloud_missing is not None and cloud_missing:
+            lines.append("Missing OneDrive capture slots (UTC): " + ", ".join(cloud_missing))
+        if error:
+            lines.append("Audit error: " + error)
+        lines.extend(["", "Saved photos remain local until successful transfer is confirmed.",
+                      "Check: journalctl -u tapo-capture.service -u tapo-upload.service -u tapo-audit.service --since 'yesterday'",
+                      "Hostname: " + os.uname().nodename])
+        if alert("audit-" + day.isoformat(), f"[Tapo C310] ALERT: {day.isoformat()} incomplete ({target} expected) in OneDrive", "\n".join(lines)):
+            marker.touch(mode=0o600, exist_ok=True)
+        return False
+    if marker.exists() and not restored.exists():
+        message = f"UTC day {day.isoformat()} is now verified with all {target} scheduled photos in OneDrive.\nHost: {os.uname().nodename}\n"
+        if alert("restored-" + day.isoformat(), f"[Tapo C310] RESOLVED: {day.isoformat()} now {target}/{target}", message):
+            restored.touch(mode=0o600, exist_ok=True)
+    return True
+
+
+def main():
+    if not START_FILE.exists():
+        print("ERROR: .monitor-start missing; please run installer", file=sys.stderr)
+        return 2
+    try:
+        start = dt.date.fromisoformat(START_FILE.read_text().strip())
+    except ValueError:
+        print("ERROR: Invalid monitoring start date", file=sys.stderr)
+        return 2
+    failures = 0
+    for days_ago in range(1, LOOKBACK + 1):
+        day = TODAY - dt.timedelta(days=days_ago)
+        if day < start:
+            continue
+        if not check(day):
+            failures += 1
+    print(f"Audit complete; {failures} day(s) with anomalies in the last {LOOKBACK} days")
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as e:
+        print(f"Audit error: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(2)

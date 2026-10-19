@@ -1,0 +1,37 @@
+# Runtime data: photos, cloud upload receipts and notifications
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.part
+.uploaded/
+.mailqueue/
+.capture-schedule.json
+.capture-schedule.lock
+.monitor-start
+.media.lock
+
+# Secrets - never commit live camera/SMTP/rclone configuration
+/tapo-timelapse.conf
+rclone.conf
+*.env
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*credentials*
+*secret*
+
+# Generated/test/build files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.log
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Independent minimal resource/maintenance monitor, no external modules."""
+import datetime as dt
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+DATA = Path(os.getenv('DATA_DIR', '/var/lib/tapo-timelapse'))
+THRESHOLD = int(os.getenv('HEALTH_FREE_SPACE_PERCENT', '20'))
+STALE = int(os.getenv('HEALTH_STALE_MINUTES', '90'))
+ENABLED = os.getenv('MONITOR_EMAIL_ENABLED', 'yes').lower() == 'yes'
+NOTIFY = '/usr/local/bin/tapo-notify'
+
+
+def queue(key, title, body):
+    if not ENABLED:
+        print(f'ALERT (email disabled): {title}')
+        return
+    result = subprocess.run([NOTIFY, 'queue', key, title], input=body,
+                            text=True, capture_output=True, timeout=30)
+    print(result.stdout.strip() if result.returncode == 0 else result.stderr.strip())
+
+
+def systemctl_info(unit):
+    p = subprocess.run(['systemctl', 'show', unit, '--property=Result,ExecMainStatus',
+                        '--no-pager'], capture_output=True, text=True, timeout=20)
+    pairs = dict(line.split('=', 1) for line in p.stdout.splitlines() if '=' in line)
+    return pairs if p.returncode == 0 else {}
+
+
+def main():
+    now = dt.datetime.now(dt.timezone.utc)
+    hostname = os.uname().nodename
+    day = now.strftime('%Y-%m-%d')
+    issues = 0
+    if Path('/run/reboot-required').exists():
+        issues += 1
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+        queue('reboot-required-' + boot,
+              '[Tapo C310] Reboot required after system updates',
+              'Updates require a reboot. The scheduled graceful reboot runs on Sundays at 04:10 UTC.\n'
+              f'Host: {hostname}\nTime UTC: {now.isoformat()}')
+    du = shutil.disk_usage(DATA)
+    pct = 100 * du.free / du.total
+    if pct < THRESHOLD:
+        issues += 1
+        queue('disk-low-' + day, '[Tapo C310] WARNING: SD card running low',
+              f'Free space: {pct:.1f} % (Threshold {THRESHOLD} %)\nHost: {hostname}')
+
+    # Detect prolonged absence of images even when other services remain active.
+    latest = None
+    for glob in ('*.png', '*.jpg'):
+        for path in DATA.glob('????/??/??/' + glob):
+            try:
+                time = path.stat().st_mtime
+                latest = max(latest, time) if latest is not None else time
+            except OSError:
+                pass
+    if latest is None:
+        # Allow initial startup grace period after installation.
+        # Use uptime rather than /proc/1 ctime (Linux-specific).
+        try:
+            uptime = float(Path('/proc/uptime').read_text().split()[0]) / 60
+        except (ValueError, OSError):
+            uptime = 0
+        missing = uptime > STALE
+    else:
+        age = (now.timestamp() - latest) / 60
+        missing = age > STALE
+    if missing:
+        issues += 1
+        queue('image-stale-' + day, '[Tapo C310] ALERT: No recent photos',
+              f'No new image file for at least {STALE} minutes.\n'
+              f'Last image: {"no image" if latest is None else dt.datetime.fromtimestamp(latest,dt.timezone.utc).isoformat()}\n'
+              f'Host: {hostname}\nCheck camera and capture timer.')
+
+    stopped = []
+    for unit in ('tapo-capture.timer', 'tapo-upload.timer',
+                 'tapo-audit.timer', 'tapo-mail.timer',
+                 'apt-daily.timer', 'apt-daily-upgrade.timer'):
+        r = subprocess.run(['systemctl', 'is-active', '--quiet', unit],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=12)
+        if r.returncode:
+            stopped.append(unit)
+    if stopped:
+        issues += 1
+        queue('timers-inactive-' + day,
+              '[Tapo C310] ALERT: System timers inactive',
+              f'Inactive timers: {", ".join(stopped)}\nHost: {hostname}')
+
+    audit = systemctl_info('tapo-audit.service')
+    # Audit exit 1 intentionally indicates missing photos.
+    if audit.get('Result') not in ('', 'success', None) and audit.get('ExecMainStatus') not in ('1',):
+        issues += 1
+        queue('audit-service-failed-' + day, '[Tapo C310] ALERT: Daily audit failed',
+              f'The audit service could not complete its checks: {audit}\n'
+              f'Host: {hostname}\nCheck: journalctl -u tapo-audit.service -n 60')
+    weekly = systemctl_info('tapo-weekly-reboot.service')
+    if weekly.get('Result') not in ('', 'success', None):
+        issues += 1
+        queue('weekly-reboot-failed-' + day,
+              '[Tapo C310] WARNING: Scheduled reboot skipped',
+              f'The weekly graceful reboot could not be completed: {weekly}\n'
+              f'Host: {hostname}')
+    apt = systemctl_info('apt-daily-upgrade.service')
+    if apt.get('Result') not in ('', 'success', None):
+        issues += 1
+        queue('apt-upgrade-failed-' + day, '[Tapo C310] WARNING: Automatic package update failed',
+              f'APT upgrade unit reported errors: {apt}\nHost: {hostname}\n'
+              'Check: journalctl -u apt-daily-upgrade.service -n 60')
+    print(f'Health check: {issues} issue(s); free SD card space {pct:.1f} %')
+    return 0
+
+if __name__ == '__main__':
+    try: sys.exit(main())
+    except Exception as e:
+        print(f'health-check error: {type(e).__name__}: {e}', file=sys.stderr)
+        sys.exit(2)

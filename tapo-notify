@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""SMTP sender with durable local queue; uses environment populated by tapo-timelapse."""
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import smtplib
+import ssl
+import sys
+import tempfile
+from datetime import datetime, timezone
+from email.message import EmailMessage
+
+
+def cfg():
+    host = os.getenv("SMTP_HOST", "").strip()
+    user = os.getenv("SMTP_USER", "").strip()
+    pwd = os.getenv("SMTP_PASSWORD", "")
+    sender = os.getenv("SMTP_FROM", "").strip() or user
+    recipients = [x.strip() for x in re.split(r"[;,]", os.getenv("SMTP_TO", "")) if x.strip()]
+    sec = os.getenv("SMTP_SECURITY", "starttls").strip().lower()
+    default_port = 465 if sec == "ssl" else 587
+    port = int(os.getenv("SMTP_PORT", str(default_port)))
+    if not all((host, user, pwd, sender, recipients)):
+        raise ValueError("SMTP_HOST, SMTP_USER, SMTP_PASSWORD, SMTP_FROM und SMTP_TO muessen gesetzt sein")
+    if sec not in ("starttls", "ssl"):
+        raise ValueError("SMTP_SECURITY muss starttls oder ssl sein (kein unverschluesseltes SMTP)")
+    return host, port, user, pwd, sender, recipients, sec
+
+
+def send(subject, body):
+    host, port, user, pwd, sender, recipients, sec = cfg()
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = sender
+    msg["To"] = ", ".join(recipients)
+    msg.set_content(body)
+    context = ssl.create_default_context()
+    if sec == "ssl":
+        with smtplib.SMTP_SSL(host, port, timeout=25, context=context) as smtp:
+            smtp.login(user, pwd)
+            smtp.send_message(msg, from_addr=sender, to_addrs=recipients)
+    else:
+        with smtplib.SMTP(host, port, timeout=25) as smtp:
+            smtp.ehlo()
+            smtp.starttls(context=context)
+            smtp.ehlo()
+            smtp.login(user, pwd)
+            smtp.send_message(msg, from_addr=sender, to_addrs=recipients)
+
+
+def spool():
+    p = Path(os.getenv("DATA_DIR", "/var/lib/tapo-timelapse")) / ".mailqueue"
+    p.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return p
+
+
+def enqueue(key, subject, body):
+    if not key or len(key) > 250:
+        raise ValueError("Ungueltiger Nachrichtenschluessel")
+    path = spool() / (hashlib.sha256(key.encode("utf-8")).hexdigest() + ".json")
+    if path.exists() or path.with_suffix(".sent").exists():
+        print("Mail bereits vorgemerkt oder versendet; keine doppelte Benachrichtigung")
+        return
+    data = {"subject": subject, "body": body, "created_utc": datetime.now(timezone.utc).isoformat()}
+    fd, temp = tempfile.mkstemp(prefix=".mail-", dir=spool())
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+    print("Email queued locally: " + subject)
+
+
+def flush():
+    # Sperre verhindert, dass zwei parallele Dienste dieselbe Mail versenden.
+    import fcntl
+    directory = spool()
+    with (directory / ".lock").open("a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        failures = 0
+        for path in sorted(directory.glob("*.json")):
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                send(data["subject"], data["body"])
+                path.with_suffix(".sent").write_text(datetime.now(timezone.utc).isoformat(), encoding="utf-8")
+                path.unlink()
+                print("SMTP email accepted: " + data["subject"])
+            except Exception as exc:
+                failures += 1
+                print(f"Email remains in queue ({type(exc).__name__}: {exc})", file=sys.stderr)
+                # SMTP offline: nicht fuer jede Mail neue Verbindungen versuchen.
+                break
+        return 1 if failures else 0
+
+
+def main():
+    if len(sys.argv) == 2 and sys.argv[1] == "flush":
+        return flush()
+    if len(sys.argv) == 2 and sys.argv[1] == "test":
+        send("[Tapo C310] SMTP test successful", "SMTP email delivery from the Raspberry Pi is working.\n\nHost: " + os.uname().nodename)
+        print("SMTP-Test erfolgreich versendet")
+        return 0
+    if len(sys.argv) == 4 and sys.argv[1] == "queue":
+        enqueue(sys.argv[2], sys.argv[3], sys.stdin.read())
+        return 0
+    print("Verwendung: tapo-notify {flush|test|queue SCHLUESSEL BETREFF} (Body ueber stdin)", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Exception as ex:
+        print(f"Benachrichtigungsfehler: {type(ex).__name__}: {ex}", file=sys.stderr)
+        sys.exit(1)

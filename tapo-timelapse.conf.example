@@ -1,0 +1,49 @@
+# Tapo C310 (3 MP) to Microsoft OneDrive. Installed as /etc/tapo-timelapse.conf.
+# Use the CAMERA account created in the Tapo app, not your TP-Link cloud login.
+# Single quotes are recommended for passwords containing $ or ! characters.
+CAMERA_HOST='192.168.1.100'
+CAMERA_PORT='554'
+CAMERA_USER='camera_account'
+CAMERA_PASSWORD='REPLACE_WITH_CAMERA_PASSWORD'
+CAMERA_STREAM='stream1'
+# Expected resolution of the C310 RTSP main stream with maximum quality enabled.
+EXPECTED_WIDTH='2304'
+EXPECTED_HEIGHT='1296'
+
+# png = lossless still frame from decoded RTSP video; jpg = smaller, lossy.
+IMAGE_FORMAT='png'
+DATA_DIR='/var/lib/tapo-timelapse'
+
+# Capture intervals: 5, 10, 15, 20, 30 or 60 minutes (UTC-aligned).
+# 30 = 48 images/day; 20 = 72 images/day; 60 = 24 images/day.
+# Changes take effect automatically on the next five-minute timer run.
+CAPTURE_INTERVAL_MINUTES='30'
+
+# Remote configured for the service user with `rclone config`.
+RCLONE_REMOTE='onedrive'
+# Keep the existing path if upgrading an installed system!
+RCLONE_ROOT='Timelapse/Grundstueck'
+# Small chunk size to reduce memory pressure on Raspberry Pi 1/2.
+RCLONE_CHUNK_SIZE='5Mi'
+# Defaults to the running user's ~/.config/rclone/rclone.conf.
+# RCLONE_CONFIG='/home/master/.config/rclone/rclone.conf'
+
+# Keep original local images until verified uploaded and older than 14 days.
+LOCAL_RETENTION_DAYS='14'
+UPLOAD_AFTER_CAPTURE='yes'
+UPLOAD_FILE_TIMEOUT_SEC='180'
+
+# Monitoring and authenticated SMTP
+MONITOR_EMAIL_ENABLED='yes'
+MONITOR_LOOKBACK_DAYS='7'
+EMAIL_ON_BOOT='yes'
+HEALTH_FREE_SPACE_PERCENT='20'
+HEALTH_STALE_MINUTES='90'
+SMTP_HOST='smtp.example.com'
+SMTP_PORT='587'
+SMTP_SECURITY='starttls'
+SMTP_USER='timelapse@example.com'
+SMTP_PASSWORD='REPLACE_WITH_SMTP_APP_PASSWORD'
+SMTP_FROM='timelapse@example.com'
+SMTP_TO='recipient@example.com'
+# Multiple recipients: recipient1@example.com,recipient2@example.com

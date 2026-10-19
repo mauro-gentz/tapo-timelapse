@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+LOCK=/var/lib/tapo-timelapse/.media.lock
+if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then
+  echo 'Package upgrade in progress; skipping scheduled reboot to protect filesystem.' >&2
+  exit 1
+fi
+# Allow an ongoing ffmpeg/rclone operation up to 10 minutes to finish.
+if ! flock -w 600 "$LOCK" /bin/bash -c '
+  # Inzwischen kann ein APT-Prozess gestartet sein.
+  if systemctl is-active --quiet apt-daily-upgrade.service || systemctl is-active --quiet apt-daily.service; then
+    echo "APT active; reboot skipped" >&2
+    exit 1
+  fi
+  logger -t tapo-weekly-reboot "Starting weekly graceful reboot"
+  /usr/bin/systemctl reboot
+'; then
+  echo 'Reboot skipped: capture/upload activity or APT in progress.' >&2
+  exit 1
+fi

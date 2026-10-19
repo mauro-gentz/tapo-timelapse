@@ -1,0 +1,1 @@
+Tapo C310 Timelapse v1.4 | 2026-10-19 | automatic serial upload, maintenance + safe reboot

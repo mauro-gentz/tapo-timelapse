@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Persist capture interval changes and enumerate UTC capture slots.
+
+Data is intentionally separate from /etc/tapo-timelapse.conf: historical UTC days
+retain their original interval if CAPTURE_INTERVAL_MINUTES is changed later.
+"""
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+UTC = dt.timezone.utc
+DATA = Path(os.environ.get('DATA_DIR', '/var/lib/tapo-timelapse'))
+HISTORY = DATA / '.capture-schedule.json'
+LOCK = DATA / '.capture-schedule.lock'
+VALID = {5, 10, 15, 20, 30, 60}
+BASE = '1970-01-01T00:00:00Z'
+
+
+def parse(t):
+    return dt.datetime.fromisoformat(t.replace('Z', '+00:00'))
+
+
+def stamp(t):
+    return t.astimezone(UTC).strftime('%Y-%m-%dT%H:%M:%SZ')
+
+
+def interval(value):
+    try:
+        n = int(value)
+    except (ValueError, TypeError):
+        raise ValueError('CAPTURE_INTERVAL_MINUTES must be 5, 10, 15, 20, 30 or 60')
+    if n not in VALID:
+        raise ValueError('CAPTURE_INTERVAL_MINUTES must be 5, 10, 15, 20, 30 or 60')
+    return n
+
+
+def save(events):
+    # Atomic replace, permissions 0600, same directory for rename.
+    fd, path = tempfile.mkstemp(prefix='.capture-schedule-', dir=DATA)
+    try:
+        # The service runs as DATA's owner. If invoked through sudo, don't
+        # replace the schedule with a root-owned file that breaks captures.
+        if os.geteuid() == 0:
+            st = DATA.stat()
+            os.fchown(fd, st.st_uid, st.st_gid)
+        with os.fdopen(fd, 'w') as fp:
+            json.dump({'version': 1, 'events': events}, fp, indent=2)
+            fp.write('\n')
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.chmod(path, 0o600)
+        os.replace(path, HISTORY)
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def read():
+    if not HISTORY.exists():
+        return []
+    obj = json.loads(HISTORY.read_text())
+    events = obj['events']
+    if not isinstance(events, list) or not events:
+        raise ValueError('Invalid schedule history')
+    for e in events:
+        parse(e['utc'])
+        interval(e['interval_minutes'])
+    return events
+
+
+def change_at(now):
+    # Avoid backdating a config change to an already-passed 5-minute tick.
+    # systemd typically invokes this within the first seconds after a tick.
+    minute = now.replace(second=0, microsecond=0)
+    elapsed = minute.minute % 5 * 60 + now.second + now.microsecond / 1e6
+    anchor = minute - dt.timedelta(minutes=minute.minute % 5)
+    if elapsed > 45:
+        anchor += dt.timedelta(minutes=5)
+    return anchor
+
+
+def init(baseline):
+    DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(LOCK, 'a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.geteuid() == 0:
+            st = DATA.stat()
+            os.fchown(lock.fileno(), st.st_uid, st.st_gid)
+            os.fchmod(lock.fileno(), 0o600)
+        if not HISTORY.exists():
+            save([{'utc': BASE, 'interval_minutes': interval(baseline)}])
+    print('Schedule initialized; existing history retained if present')
+
+
+def sync(current, now):
+    DATA.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with open(LOCK, 'a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if os.geteuid() == 0:
+            st = DATA.stat()
+            os.fchown(lock.fileno(), st.st_uid, st.st_gid)
+            os.fchmod(lock.fileno(), 0o600)
+        events = read()
+        if not events:
+            # Fallback for manually installed scripts; installer initializes history.
+            events = [{'utc': BASE, 'interval_minutes': current}]
+            save(events)
+        elif events[-1]['interval_minutes'] != current:
+            effective = change_at(now)
+            # If a change gets made several times before its next activation,
+            # overwrite that future event instead of creating an ambiguity.
+            if parse(events[-1]['utc']) >= now and len(events) > 1:
+                events[-1] = {'utc': stamp(effective), 'interval_minutes': current}
+            else:
+                events.append({'utc': stamp(effective), 'interval_minutes': current})
+            save(events)
+            print(f'Schedule updated to every {current} minutes from {stamp(effective)}', file=sys.stderr)
+        return events
+
+
+def slots(events, day):
+    # 5-minute UTC grid; no DST ambiguity and supports all VALID intervals.
+    midnight = dt.datetime.combine(day, dt.time(), tzinfo=UTC)
+    ordered = sorted([(parse(e['utc']), int(e['interval_minutes'])) for e in events])
+    slots_for_day = []
+    active = ordered[0][1]
+    k = 0
+    for i in range(288):
+        when = midnight + dt.timedelta(minutes=5*i)
+        while k + 1 < len(ordered) and ordered[k + 1][0] <= when:
+            k += 1
+            active = ordered[k][1]
+        if (i * 5) % active == 0:
+            slots_for_day.append(when)
+    return slots_for_day
+
+
+def run():
+    if len(sys.argv) < 2:
+        raise ValueError('Usage: tapo-schedule init MINUTES | sync | due | next | expected YYYY-MM-DD | interval')
+    command = sys.argv[1]
+    if command == 'init':
+        init(sys.argv[2]); return
+    current = interval(os.environ.get('CAPTURE_INTERVAL_MINUTES', '30'))
+    now = dt.datetime.now(UTC)
+    if command in ('sync', 'due', 'interval'):
+        events = sync(current, now)
+    else:
+        events = read()
+        if not events:
+            raise ValueError('Schedule history missing; run installer')
+    if command == 'sync':
+        return
+    if command == 'interval':
+        print(current); return
+    if command == 'expected':
+        day = dt.date.fromisoformat(sys.argv[2])
+        print(json.dumps([x.strftime('%H:%M') for x in slots(events, day)]))
+        return
+    if command == 'next':
+        for offset in range(3):
+            day = now.date() + dt.timedelta(days=offset)
+            for tick in slots(events, day):
+                if tick > now:
+                    print(stamp(tick))
+                    return
+        raise ValueError('No next scheduled slot')
+    if command == 'due':
+        # A slot is captured only during the first five minutes after its tick.
+        # Delayed/manual invocations outside a valid interval do nothing.
+        base = now.replace(minute=(now.minute // 5) * 5, second=0, microsecond=0)
+        if base in slots(events, base.date()):
+            print(base.strftime('%Y/%m/%d/%Y-%m-%d_%H-%M-00Z'))
+        return
+    raise ValueError(f'Unknown command: {command}')
+
+
+if __name__ == '__main__':
+    try:
+        run()
+    except (ValueError, OSError, KeyError, json.JSONDecodeError) as ex:
+        print(f'tapo-schedule error: {ex}', file=sys.stderr)
+        sys.exit(2)
